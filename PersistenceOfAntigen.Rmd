@@ -1,0 +1,379 @@
+---
+title: "PersistenceOfAntigen"
+author: "Alexandra Cassano"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  pdf_document:
+    fig_width: 6.25
+    toc: yes
+    fig_caption: yes
+    number_sections: yes
+    keep_tex: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prepare work-space, global variables, and data
+
+## Install Packages (if needed set eval=TRUE, otherwise this chunk will not run)
+
+This segment of code should only be run if the packages are not already installed on whichever computer this is being run on. In order to have this chunk run, change `eval=FALSE` to `eval=TRUE` in the chunk header.
+
+```{r install_pkgs, eval=FALSE, echo=FALSE}
+install.packages(c("BiocManager",
+                   "tidyverse",
+                   "gplots",
+                   "ggplot2",
+                   "ggrepel",
+                   "stringi",
+                   "pheatmap",
+                   "RColorBrewer"))
+
+BiocManager::install(c("limma",
+                       "edgeR",
+                       "Glimma",
+                       "DESeq2"))
+
+```
+
+## Load packages and set global variables
+
+First, all of the "R packages" that will be used for all of our analysis, data manipulation, and data visualization must be loaded. The packages are broken up into those used for RNA seq analysis, basic plotting, data visualization, and general use/data manipulation. The current working directory is also set. This is the folder that contains the data file, and where all saved outputs will be saved to. Finally, the major functions are all imported. These functions are saved in the "SourceFunctions" folder in within the working directory. Once these functions have been 'sourced' they are available for use in this file.
+
+```{r load_pkgs, echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# load R packages for RNA seq analysis
+library(Glimma)
+library(edgeR)
+library(biomaRt)
+library(DESeq2)
+library(org.Mm.eg.db)
+
+# load ggplot2 and associated R packages for plotting
+library(ggplot2)
+library(ggrepel)
+library(gtable)
+library(scales)
+library(grid)
+library(RColorBrewer)
+library(ggpubr)
+
+# load general R packages for data manipulation
+library(utils)
+library(stringi)
+library(stringr)
+library(knitr)
+library(rmarkdown)
+library(roxygen2)
+library(tidyverse)
+library(tinytex)
+
+```
+
+# Data wrangling
+
+## Import featurecounts table and metadata
+
+The `raw_counts` variable is set as the csv file containing the output of featurecounts after using STAR to align reads to the reference genome. The csv file must first be "cleaned up" by removing unneeded columns such as *Chr*, *start*, *end* etc. The `meta` variable is set as the csv file containing metadata about the current experiment. At a minimum, it must contain sample names and treatment conditions. Samples not of interest (in a combined experiment, irrelevant conditions) can be removed from both raw counts and metadata. It can contain further information such as experiment day. The samples **must** be in the same order in the `meta` file as they are in `raw_counts`. Strict pre-filtering is applied to the raw data to remove any genes that have a total count number across samples less than the user defined minimum. Additionally, genes that have a total count that is less than a user defined value, when the single max count is subtracted are removed. This is done to filter out genes that have a high read count for just one sample, but are not expressed in other samples. These filtering step minimize noise and remove outliers.
+
+```{r import_data}
+#set working directory & the file names for your imported CSVs
+cwd <-"~/GitHub/PersistenceOfAntigen"
+
+
+countsCSV <- "PersistenceOfAntigen-ReadCounts.csv"
+countsCSV <- paste(cwd, countsCSV, sep = "/")
+metadataCSV <- "PersistenceOfAntigen-metadata.csv"
+metadataCSV <- paste(cwd, metadataCSV, sep = "/")
+
+# Raw counts file is generated from featurecounts function after using STAR to align reads
+raw_counts <- read.csv(countsCSV, header = TRUE, sep = ",")
+# #renames each row as the GeneID and removes the Geneid column
+rownames(raw_counts) <- raw_counts$Geneid
+raw_counts <-  dplyr::select(raw_counts, -Geneid)
+raw_counts <- rename_with(.data = raw_counts, .fn = ~gsub("_", " #", .x))
+
+# read in metadata table & remove irrelevant rows, set condition as 'factors' and order them
+meta <- read.csv(metadataCSV, header = TRUE, sep = ",")
+
+meta$Condition <- factor(meta$Condition,
+                         levels = c("NaiveTCR75",
+                                    "Tolerant",
+                                    "SingleDST",
+                                    "Listeria"))
+meta$Condition <- recode_factor(meta$Condition, NaiveTCR75 = "Naive")
+meta$SampleID <- gsub("_", " #", meta$SampleID)
+
+#clean up meta table
+row.names(meta) <- meta$SampleID
+meta <- meta %>% dplyr::select(-c(SampleID, SacDay))
+
+# pre-filtering, retain only rows that have at more than minimum counts across all samples
+count_minimum <- 500
+raw_counts$row_max <- apply(raw_counts[,1:18], 1, max)
+raw_counts$row_sum <- apply(raw_counts[,1:18], 1, sum)
+
+raw_counts <- raw_counts %>%
+  dplyr::filter(raw_counts$row_sum > count_minimum)
+
+raw_counts <- raw_counts %>%
+  dplyr::filter((raw_counts$row_sum - raw_counts$row_max) > count_minimum) %>%
+  dplyr::select(-c(row_max, row_sum))
+
+```
+
+Set global variables for plotting such as the color palette, labels, and shapes. A treatment aesthetics dataframe is created for use in creating consistent plots throughout. \# Global aesthetic variables
+
+```{r global_aesthetics}
+#theme for any GG plots
+# dataframe, color choices for plots
+color_palette <- data.frame(
+  colorID = c("#ce0b0b", "#036FFC", "#389538",
+              "#9d00eb", "#ffef0d",
+              "#ed9a00", "#79491c",
+              "#000000", "#FFFFFF", "#848484", "#060186"),
+  colorName = c("red", "blue", "green",
+                "purple", "yellow",
+                "orange", "brown",
+                "black", "white", "grey", "navy"))
+
+
+# dataframe, shape choices for plots
+shape_palette <- data.frame(
+  shapeID = c(1, 19, 10,
+              5, 18, 9,
+              0, 15, 7,
+              2, 17, 6,
+              4, 3, 8,
+              24, 22, 21, 23),
+  shapeDescription = c("open circle", "solid circle", "crossed circle",
+                       "open diamond", "solid diamond", "crossed diamond",
+                       "open square", "solid square", "crossed square",
+                       "open triangle up", "solid triangle up", "open triangle down",
+                       "cross", "plus", "asterik",
+                       "fillable triangle", "fillable square", "fillable circle", "fillable diamond"))
+
+
+
+sample_labels <- (meta$Condition)
+condition_labels <- unique(sample_labels) %>% sort() %>% print()
+
+# set variables for ggplot theme use later on
+
+treatment_aes <- data.frame(labels = condition_labels)
+hues <- bind_rows(color_palette[str_detect(color_palette$colorName, 'black'), ],
+                  color_palette[str_detect(color_palette$colorName, 'green'), ],
+                  color_palette[str_detect(color_palette$colorName, 'white'), ],
+                  color_palette[str_detect(color_palette$colorName, 'purple'), ])
+shapes <- bind_rows(shape_palette[str_detect(shape_palette$shapeDescription, 'fillable triangle'), ],
+                    shape_palette[str_detect(shape_palette$shapeDescription, 'fillable triangle'), ],
+                    shape_palette[str_detect(shape_palette$shapeDescription, 'fillable triangle'), ],
+                    shape_palette[str_detect(shape_palette$shapeDescription, 'fillable triangle'), ])
+
+outline <- bind_rows(color_palette[str_detect(color_palette$colorName, 'black'), ],
+                  color_palette[str_detect(color_palette$colorName, 'green'), ],
+                  color_palette[str_detect(color_palette$colorName, 'black'), ],
+                  color_palette[str_detect(color_palette$colorName, 'purple'), ])
+colnames(outline) <- NULL
+colnames(outline) <- c("outlineID", "outlineName")
+
+treatment_aes <- dplyr::bind_cols(treatment_aes, shapes, hues, outline) %>%
+  print()
+
+```
+
+# Differential Gene Expression Analysis
+
+The DESeq2 package has functions to find differentially expressed genes, statistics associated with this, and normalized counts. first a DESeq data object is created using `raw_counts` and `meta`, specifying that `condition` is the variable of interest in the metadata table. The `DESeq` function is run and from this output, normalized results (variance stabilized transformation, rlog transformed, and normalized counts) as well as a pairwise comparison between 2 specified conditions are saved for use further on. The results default to using an Log Fold Change shrinking algorithm. This mitigates the effects of any single sample on the log fold change calculations, minimizing noise. The calculation used is the "ashr" algorithm[@stephens2016].
+
+## Run DESeq and normalization
+
+```{r DESeq2}
+# construction of the DESeq data object
+deseq_dataset <- DESeqDataSetFromMatrix(countData = raw_counts,
+                                        colData = meta,
+                                        design = ~Condition)
+
+
+
+#run DESeq2 package on the data set
+dseq <- DESeq(deseq_dataset)
+
+#normalized
+rlog_norm <- rlog(dseq, blind = FALSE)
+rlog_df <- as.data.frame(assay(rlog_norm))
+
+
+
+# normalized counts for each sample based on DESeq2's median of ratios method - counts divided by sample-specific size factors determined by median ratio of gene counts relative to geometric mean per gene
+# for this, size factors must be generated and added to the dseq object, size factors should be around 1
+dseq <- estimateSizeFactors(dseq)
+
+normcounts <- DESeq2::counts(dseq, normalized = TRUE) %>%
+  data.frame() %>%
+  rownames_to_column(var = "GeneID")
+
+```
+## Annotate Results
+
+The initial `raw_counts` table, and therefore all DESeq results derived from it, use the *Ensembl ID* to identify each gene. However, this is not a useful identifier for most humans. The BiomaRt package can be used to match the *Ensembl ID* with it's corresponding *MGI Symbol*, *MGI Description*, *Gene Biotype*, and *Entrez (NCBI) ID*. The genemap can be altered to omit or include different attributes as needed. The genmap is then used along with a `deseq results object` in the `annotate_biomart()` function to add these descriptors to the results. Any data frame that has *Ensembl ID*s can be used in this annotation function. \### make genemap
+
+```{r make_genemap}
+#annotate function
+annotate_biomart <- function(res, gm) {
+
+  # join the annotations with the results
+  res <- res %>% dplyr::left_join(gm, by = c("GeneID" = "ensembl_gene_id"))
+
+  # rename the columns
+  colList <- colnames(res)
+  newCols <- purrr::map(colList, rename_columns)
+  colnames(res) <- NULL
+  colnames(res) <- newCols
+
+  # return annotated results table
+  return(res)
+}
+
+all_genes <- as.data.frame(normcounts$GeneID)
+
+# creates biomart object to get the gene annotations for diff expressed genes
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+
+genemap <- getBM(attributes = c("ensembl_gene_id",
+                                "mgi_symbol"),
+                 filters = "ensembl_gene_id",
+                 values = all_genes,
+                 mart = ensembl)
+
+genemap <- genemap %>%
+  dplyr::distinct(ensembl_gene_id, .keep_all = TRUE)
+
+reorder_rlogdf_columns <- function(df){
+  rownames(df) <- df$GeneID
+  df <- df %>%
+    relocate(c(MGI_Symbol))
+  return (df)
+}
+
+rename_columns <- function(colstr){
+
+  colstr <- BiocGenerics::paste(colstr)
+
+  if (stringi::stri_cmp_equiv(colstr, "ensembl_gene_id", strength = 1)) {
+    return("GeneID") }
+
+  if(stringi::stri_cmp_equiv(colstr, "mgi_symbol", strength = 1)){
+    return("MGI_Symbol") }
+
+  else if(stringi::stri_cmp_equiv(colstr, "mgi_description", strength = 1)){
+    return("MGI_Desc") }
+
+  else if(stringi::stri_cmp_equiv(colstr, "gene_biotype", strength = 1)){
+    return("GeneType") }
+
+  else if(stringi::stri_cmp_equiv(colstr, "entrezgene_id", strength = 1)){
+    return("EntrezID") }
+
+  else if(stringi::stri_cmp_equiv(colstr, "go_id", strength = 1)){
+    return("GO_ID") }
+
+  else{return(colstr)}
+}
+
+
+
+```
+
+### Annotate rlog dataframes
+
+```{r annotate_rlog}
+rlog_df <- rownames_to_column(rlog_df, var = "GeneID")
+rlog_df <- annotate_biomart(rlog_df, genemap) %>%
+  reorder_rlogdf_columns()
+
+```
+
+## Principal Component Analysis
+
+Principal component analysis will illustrate the differences between samples as a whole, reducing the number of dimensions.
+
+```{r PCA_analysis}
+
+pca_analysis_figure <- function(dseq_transform,
+                                labels, fills, shapes, outlines,
+                                plot_title = "Principal Component Analysis")
+{
+  # save the results of the PCA plot as an object so that we can plot the data using our good friend ggplot2
+  pca_data <- DESeq2::plotPCA(dseq_transform, intgroup = "Condition", returnData = TRUE)
+
+  # get the percent variation of the PCA data so that we can add that to the plot
+  percent_variation <- round(100 * attr(pca_data, "percentVar"))
+
+  # create plot
+  pca_plot <-
+    ggplot2::ggplot(pca_data, aes(x = PC1,
+                                  y = PC2,
+                                  color = Condition,
+                                  shape = Condition,
+                                  fill = Condition)) +
+    ggplot2::geom_point(size = 4, stroke = 2) +
+    scale_color_manual(labels = labels,
+                       values = outlines,
+                       name = "Condition:") +
+    scale_fill_manual(labels = labels,
+                      values = fills,
+                      name = "Condition:") +
+    scale_shape_manual(labels = labels,
+                       values = shapes,
+                       name = "Condition:") +
+    ggplot2::xlab(paste0("PC1: ", percent_variation[1], "% variance")) +
+    ggplot2::ylab(paste0("PC2: ", percent_variation[2], "% variance")) +
+    ggplot2::labs(title = plot_title)
+
+     pca_plot + theme(panel.background = ggplot2::element_rect(fill = "transparent"),
+                     plot.background = ggplot2::element_rect(fill = "transparent", color = NA),
+                     axis.line = ggplot2::element_line("black", 1),
+                     aspect.ratio = (10/12),
+                     panel.grid = element_blank(),
+                     plot.title = ggplot2::element_text(hjust = 0.5, size = 18, face = "bold"),
+                     plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 13, face = "italic"),
+                     axis.text.x = element_text(size = 13),
+                     axis.text.y = element_text(size = 13),
+                     axis.title = element_text(size = 15),
+                     legend.title = element_text(size = 15),
+                     legend.text = element_text(size = 14))
+
+}
+
+
+
+# run the function
+pca_analysis_figure(dseq_transform = rlog_norm,
+             labels = treatment_aes$labels,
+             fills = treatment_aes$colorID,
+             shapes = treatment_aes$shapeID,
+             outlines = treatment_aes$outlineID,
+             plot_title = "TCR75 PCA")
+
+
+
+```
+
+
+# References:
+
+Gao, C.-H., Yu, G., and Cai, P. (2021). ggVennDiagram: An Intuitive, Easy-to-Use, and Highly Customizable R Package to Generate Venn Diagram. Frontiers in Genetics 12, 1598. doi: 10.3389/fgene.2021.706907.
+```{r citations}
+print(citation("biomaRt"))
+print(citation("DESeq2"))
+print(citation("ggplot2"))
+print(citation("tidyverse"))
+print(citation("utils"))
+
+
+```
